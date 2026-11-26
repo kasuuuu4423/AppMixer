@@ -11,12 +11,10 @@ struct RoutingPreferences: Sendable {
 actor AudioRouter {
     private var routes: [RouteKey: AudioRoute] = [:]
 
-    func update(_ preferences: RoutingPreferences, apps: [PlayingApp]) throws {
+    func update(_ preferences: RoutingPreferences, apps: [PlayingApp], output: OutputDevice?) throws {
         guard preferences.enabled else { return stop() }
         do {
-            let output = try HAL.property(HAL.system, kAudioHardwarePropertyDefaultOutputDevice,
-                                          initial: AudioObjectID(0))
-            guard output != 0 else { throw AudioFailure("既定の音声出力が見つかりません") }
+            guard let output else { throw AudioFailure("既定の音声出力が見つかりません") }
             let adjusted = apps.filter { preferences.volumes[$0.id, default: 100] != 100 }
             var desired: [RouteKey: Int] = [:]
             for app in adjusted {
@@ -63,7 +61,7 @@ actor AudioRouter {
 private struct RouteKey: Hashable {
     enum Kind: Hashable { case app(String), remainder }
     let kind: Kind
-    let output: AudioObjectID
+    let output: OutputDevice
     let processes: [AudioObjectID]
 }
 
@@ -84,25 +82,27 @@ private final class AudioRoute {
     }
 
     private func connect(key: RouteKey, volume: Int, equalizer: Equalizer, validateOnly: Bool) throws {
-        let outputUID = try HAL.text(key.output, kAudioDevicePropertyDeviceUID)
-        let inputs = try HAL.objects(key.output, kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput)
-        let transport = try HAL.property(key.output, kAudioDevicePropertyTransportType, initial: UInt32(0))
-        guard !outputUID.isEmpty, inputs.isEmpty, transport == kAudioDeviceTransportTypeBuiltIn else {
-            throw AudioFailure("この試作では、Macの内蔵スピーカーを出力先に選んでください")
+        let outputUID = try HAL.text(key.output.id, kAudioDevicePropertyDeviceUID)
+        let transport = try HAL.property(key.output.id, kAudioDevicePropertyTransportType, initial: UInt32(0))
+        let physicalTransports = [kAudioDeviceTransportTypeBuiltIn, kAudioDeviceTransportTypeUSB,
+                                  kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE,
+                                  kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeDisplayPort,
+                                  kAudioDeviceTransportTypeThunderbolt]
+        guard !outputUID.isEmpty, physicalTransports.contains(transport) else {
+            throw AudioFailure("この出力先での音声処理には対応していません")
         }
-        _ = try Self.stereoFormat(key.output, scope: kAudioDevicePropertyScopeOutput)
+        _ = try Self.stereoFormat(key.output.id, scope: kAudioDevicePropertyScopeOutput)
 
         let description: CATapDescription
         if key.kind == .remainder {
             guard let ownProcess = HAL.ownProcess() else {
                 throw AudioFailure("AppMixer自身の音声出力を除外できないため、EQを停止しました")
             }
-            description = CATapDescription(stereoGlobalTapButExcludeProcesses: key.processes + [ownProcess])
+            description = CATapDescription(excludingProcesses: key.processes + [ownProcess], deviceUID: outputUID, stream: 0)
         } else {
-            description = CATapDescription(stereoMixdownOfProcesses: key.processes)
+            description = CATapDescription(processes: key.processes, deviceUID: outputUID, stream: 0)
         }
         description.name = "AppMixer"
-        description.deviceUID = outputUID
         description.isPrivate = true
         description.muteBehavior = validateOnly ? .unmuted : .mutedWhenTapped
         try HAL.check(AudioHardwareCreateProcessTap(description, &tap), "音声タップを作成できません")
@@ -113,25 +113,55 @@ private final class AudioRoute {
             kAudioAggregateDeviceMainSubDeviceKey: outputUID,
             kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputUID]],
             kAudioAggregateDeviceIsPrivateKey: true,
-            kAudioAggregateDeviceTapListKey: [[
-                kAudioSubTapUIDKey: description.uuid.uuidString,
-                kAudioSubTapDriftCompensationKey: true
-            ]]
         ]
         try HAL.check(AudioHardwareCreateAggregateDevice(specification as CFDictionary, &aggregate),
                       "内部の音声入出力を作成できません")
-        let input = try Self.stereoFormat(aggregate, scope: kAudioDevicePropertyScopeInput)
+        let hardwareInputs = try HAL.objects(aggregate, kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput)
+        let tapUID = try HAL.text(tap, kAudioTapPropertyUID)
+        var composition = specification
+        composition[kAudioAggregateDeviceTapListKey] = [[kAudioSubTapUIDKey: tapUID,
+                                                         kAudioSubTapDriftCompensationKey: true]]
+        try withExtendedLifetime(composition as CFDictionary) {
+            var value = Unmanaged.passUnretained($0)
+            var address = AudioObjectPropertyAddress(mSelector: kAudioAggregateDevicePropertyComposition,
+                                                     mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
+            try HAL.check(AudioObjectSetPropertyData(aggregate, &address, 0, nil,
+                          UInt32(MemoryLayout.size(ofValue: value)), &value), "音声タップを接続できません")
+        }
+        // Identify the tap by the new stream ID, never by a microphone's channel count or assumed position.
+        let inputStreams = try HAL.objects(aggregate, kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeInput)
+        let inserted = inputStreams.filter { !hardwareInputs.contains($0) }
+        guard inputStreams.count == hardwareInputs.count + 1,
+              hardwareInputs.allSatisfy({ inputStreams.contains($0) }),
+              inserted.count == 1, let tapStream = inserted.first,
+              let tapIndex = inputStreams.firstIndex(of: tapStream) else {
+            throw AudioFailure("音声タップをマイク入力と区別できないため、音声処理を停止しました")
+        }
+        let input = try Self.stereoFormat(for: tapStream)
         let output = try Self.stereoFormat(aggregate, scope: kAudioDevicePropertyScopeOutput)
         guard input.mSampleRate == output.mSampleRate, output.mSampleRate > 0 else {
             throw AudioFailure("入出力のサンプルレートが一致しません")
+        }
+        if !hardwareInputs.isEmpty {
+            let channels = try HAL.streamChannels(aggregate, scope: kAudioObjectPropertyScopeInput)
+            let expected = try inputStreams.map {
+                try HAL.property($0, kAudioStreamPropertyVirtualFormat, initial: AudioStreamBasicDescription())
+                    .mChannelsPerFrame
+            }
+            guard channels == expected, channels[tapIndex] == 2, input.mBytesPerFrame == 8 else {
+                throw AudioFailure("この機器の音声タップを安全に分離できません")
+            }
         }
         guard !validateOnly else { return }
         let renderer = Renderer(sampleRate: output.mSampleRate, volume: volume, equalizer: equalizer)
         self.renderer = renderer
         try HAL.check(AudioDeviceCreateIOProcIDWithBlock(&ioProc, aggregate, nil) { _, input, _, output, _ in
-            renderer.render(input, output)
+            renderer.render(input, output, tapIndex: tapIndex, inputStreamCount: inputStreams.count)
         }, "音声処理を登録できません。システムオーディオの録音権限を確認してください")
         guard let ioProc else { throw AudioFailure("音声処理を登録できません") }
+        if !hardwareInputs.isEmpty {
+            try HAL.setTapOnlyInput(aggregate, ioProc: ioProc, tapIndex: tapIndex, streamCount: inputStreams.count)
+        }
         try HAL.check(AudioDeviceStart(aggregate, ioProc),
                       "音声処理を開始できません。システムオーディオの録音権限を確認してください")
         started = true
@@ -143,6 +173,10 @@ private final class AudioRoute {
         guard streams.count == 1, let stream = streams.first else {
             throw AudioFailure("この試作では、単一のステレオ音声ストリームのみ対応しています")
         }
+        return try stereoFormat(for: stream)
+    }
+
+    private static func stereoFormat(for stream: AudioObjectID) throws -> AudioStreamBasicDescription {
         let format = try HAL.property(stream, kAudioStreamPropertyVirtualFormat,
                                       initial: AudioStreamBasicDescription())
         let planar = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
@@ -190,15 +224,25 @@ func checkAudioOutput() throws -> String {
     return "\(name): \(format.mChannelsPerFrame)ch / \(Int(format.mSampleRate))Hz, input streams: \(inputs.count), self: \(String(describing: HAL.ownProcess()))"
 }
 
-func checkAudioRoutes(app: PlayingApp) throws {
-    let output = try HAL.property(HAL.system, kAudioHardwarePropertyDefaultOutputDevice, initial: AudioObjectID(0))
+func checkAudioRoutes(app: PlayingApp, named outputName: String? = nil) throws {
+    let output: OutputDevice
+    if let outputName {
+        let devices = try HAL.objects(HAL.system, kAudioHardwarePropertyDevices)
+        guard let device = devices.first(where: { (try? HAL.text($0, kAudioObjectPropertyName)) == outputName }) else {
+            throw AudioFailure("指定のオーディオ機器が見つかりません: \(outputName)")
+        }
+        output = try OutputDevice(id: device)
+    } else {
+        guard let device = try OutputDevice.current() else { throw AudioFailure("既定の音声出力が見つかりません") }
+        output = device
+    }
     let appRoute = try AudioRoute(key: RouteKey(kind: .app(app.id), output: output, processes: app.processes),
                                   volume: 20, equalizer: Equalizer(), validateOnly: true)
     defer { appRoute.stop() }
     let eqRoute = try AudioRoute(key: RouteKey(kind: .remainder, output: output, processes: app.processes),
                                  volume: 100, equalizer: Equalizer(), validateOnly: true)
     defer { eqRoute.stop() }
-    print("Prepared \(app.name) and global EQ routes without starting I/O.")
+    print("Prepared \(app.name) and global EQ routes for \(output.name) without starting I/O.")
 }
 
 // Core Audio serializes calls for one IOProc. The UI-facing path only writes the atomic settings.
@@ -225,13 +269,22 @@ private final class Renderer: @unchecked Sendable {
         settings.store(Self.pack(volume, equalizer), ordering: .relaxed)
     }
 
-    func render(_ input: UnsafePointer<AudioBufferList>, _ output: UnsafeMutablePointer<AudioBufferList>) {
+    func render(_ input: UnsafePointer<AudioBufferList>, _ output: UnsafeMutablePointer<AudioBufferList>,
+                tapIndex: Int, inputStreamCount: Int) {
         let inputBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outputBuffers = UnsafeMutableAudioBufferListPointer(output)
         for buffer in outputBuffers where buffer.mData != nil {
             memset(buffer.mData, 0, Int(buffer.mDataByteSize))
         }
-        guard let source = StereoBuffer(inputBuffers), let destination = StereoBuffer(outputBuffers) else { return }
+        let source: StereoBuffer?
+        if inputStreamCount == 1 {
+            source = StereoBuffer(inputBuffers)
+        } else {
+            guard inputBuffers.count == inputStreamCount,
+                  !inputBuffers.indices.contains(where: { $0 != tapIndex && inputBuffers[$0].mData != nil }) else { return }
+            source = StereoBuffer(interleaved: inputBuffers[tapIndex])
+        }
+        guard let source, let destination = StereoBuffer(outputBuffers) else { return }
         let next = settings.load(ordering: .relaxed)
         if applied != next {
             processor.configure(volume: Int(next & 0xff), equalizer: Equalizer(
@@ -254,6 +307,14 @@ private struct StereoBuffer {
     let right: UnsafeMutablePointer<Float>
     let frames: Int
     let stride: Int
+
+    init?(interleaved buffer: AudioBuffer) {
+        guard buffer.mNumberChannels == 2, let data = buffer.mData else { return nil }
+        left = data.assumingMemoryBound(to: Float.self)
+        right = left + 1
+        frames = Int(buffer.mDataByteSize) / 8
+        stride = 2
+    }
 
     init?(_ buffers: UnsafeMutableAudioBufferListPointer) {
         guard !buffers.isEmpty, let first = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return nil }

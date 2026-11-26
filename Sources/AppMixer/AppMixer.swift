@@ -16,7 +16,7 @@ enum AppMixer {
                     guard let app = apps.first(where: \.isPlaying) ?? apps.first else {
                         throw AudioFailure("音声処理の候補アプリが見つかりません")
                     }
-                    try checkAudioRoutes(app: app)
+                    try checkAudioRoutes(app: app, named: CommandLine.arguments.dropFirst(2).first)
                 }
             } catch {
                 FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
@@ -43,12 +43,14 @@ private struct AppMixerScene: App {
 final class MixerModel {
     private(set) var preferences = RoutingPreferences()
     private(set) var apps: [PlayingApp] = []
+    private(set) var output: OutputDevice?
     private(set) var message: String?
     private(set) var busy = false
     @ObservationIgnored private let router = AudioRouter()
     @ObservationIgnored private var pending = false
     @ObservationIgnored private var monitor: Task<Void, Never>?
     @ObservationIgnored private var preMuteVolumes: [String: Int] = [:]
+    @ObservationIgnored private var suspended = false
 
     func startMonitoring() {
         guard monitor == nil else { return }
@@ -62,21 +64,26 @@ final class MixerModel {
     }
 
     private func refresh() {
+        let previousOutput = output
+        output = try? OutputDevice.current()
+        if previousOutput != output {
+            suspended = false
+            message = nil
+        }
         do {
-            let previous = apps.map(\.processes)
-            apps = try findAudioApps()
-            if !busy && (preferences.enabled || previous != apps.map(\.processes)) { apply() }
+            let currentApps = try findAudioApps()
+            let changed = apps.map(\.processes) != currentApps.map(\.processes)
+            apps = currentApps
+            if preferences.enabled && !suspended && (!busy || previousOutput != output || changed) { apply() }
         } catch {
-            if preferences.enabled {
-                preferences.enabled = false
-                apply()
-            }
+            if previousOutput != output && preferences.enabled { apply() }
             message = error.localizedDescription
         }
     }
 
     func enable(_ enabled: Bool) {
         message = nil
+        suspended = false
         preferences.enabled = enabled
         apply()
     }
@@ -116,11 +123,18 @@ final class MixerModel {
         Task {
             while pending {
                 pending = false
+                let requestedOutput = output
                 do {
-                    try await router.update(preferences, apps: apps)
+                    try await router.update(preferences, apps: apps, output: requestedOutput)
+                    if requestedOutput == output {
+                        suspended = false
+                        message = nil
+                    }
                 } catch {
-                    preferences.enabled = false
-                    message = error.localizedDescription
+                    if requestedOutput == output && preferences.enabled {
+                        suspended = true
+                        message = "音声処理を一時停止：\(error.localizedDescription)"
+                    }
                 }
             }
             busy = false
@@ -140,6 +154,9 @@ private struct MixerPanel: View {
                     .toggleStyle(.switch)
                     .controlSize(.small)
             }
+            LabeledContent("出力先", value: mixer.output?.name ?? "未検出")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             if let message = mixer.message {
                 Text(message).font(.caption).foregroundStyle(.red)
             } else if !mixer.preferences.enabled {

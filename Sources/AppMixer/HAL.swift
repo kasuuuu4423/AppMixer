@@ -54,6 +54,39 @@ enum HAL {
         return Array(ids.prefix(Int(size) / width))
     }
 
+    static func streamChannels(_ device: AudioObjectID, scope: AudioObjectPropertyScope) throws -> [UInt32] {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration,
+                                                 mScope: scope, mElement: 0)
+        var size: UInt32 = 0
+        try check(AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size),
+                  "音声バッファの構成を取得できません")
+        guard size > 0 else { return [] }
+        let data = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { data.deallocate() }
+        try check(AudioObjectGetPropertyData(device, &address, 0, nil, &size, data),
+                  "音声バッファの構成を取得できません")
+        return UnsafeMutableAudioBufferListPointer(data.assumingMemoryBound(to: AudioBufferList.self))
+            .map(\.mNumberChannels)
+    }
+
+    static func setTapOnlyInput(_ device: AudioObjectID, ioProc: AudioDeviceIOProcID,
+                                tapIndex: Int, streamCount: Int) throws {
+        let offset = MemoryLayout<AudioHardwareIOProcStreamUsage>.offset(of: \.mStreamIsOn)!
+        let size = offset + streamCount * MemoryLayout<UInt32>.stride
+        let data = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: MemoryLayout<AudioHardwareIOProcStreamUsage>.alignment)
+        defer { data.deallocate() }
+        data.storeBytes(of: unsafeBitCast(ioProc, to: UnsafeMutableRawPointer.self), as: UnsafeMutableRawPointer.self)
+        data.storeBytes(of: UInt32(streamCount), toByteOffset: MemoryLayout<AudioHardwareIOProcStreamUsage>
+            .offset(of: \.mNumberStreams)!, as: UInt32.self)
+        let flags = (data + offset).bindMemory(to: UInt32.self, capacity: streamCount)
+        flags.initialize(repeating: 0, count: streamCount)
+        flags[tapIndex] = 1
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyIOProcStreamUsage,
+                                                 mScope: kAudioObjectPropertyScopeInput, mElement: 0)
+        try check(AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(size), data),
+                  "機器のマイク入力を無効にできないため、音声処理を停止しました")
+    }
+
     static func ownProcess() -> AudioObjectID? {
         var pid = getpid()
         var address = AudioObjectPropertyAddress(
@@ -66,6 +99,25 @@ enum HAL {
             system, &address, UInt32(MemoryLayout<pid_t>.size), &pid, &size, &result
         )
         return status == noErr && result != 0 ? result : nil
+    }
+}
+
+struct OutputDevice: Hashable, Sendable {
+    let id: AudioObjectID
+    let name: String
+    let sampleRate: Double
+    let streams: [AudioObjectID]
+
+    init(id: AudioObjectID) throws {
+        self.id = id
+        name = try HAL.text(id, kAudioObjectPropertyName)
+        sampleRate = try HAL.property(id, kAudioDevicePropertyNominalSampleRate, initial: Double(0))
+        streams = try HAL.objects(id, kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput)
+    }
+
+    static func current() throws -> OutputDevice? {
+        let id = try HAL.property(HAL.system, kAudioHardwarePropertyDefaultOutputDevice, initial: AudioObjectID(0))
+        return id == 0 ? nil : try OutputDevice(id: id)
     }
 }
 
