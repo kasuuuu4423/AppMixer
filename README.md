@@ -11,7 +11,11 @@ AppMixerは、アプリごとの音量と出力全体の音質を調整できる
 
 macOS 26以降。音声処理は内蔵出力・USB・Bluetooth・HDMI・DisplayPort・Thunderboltのうち、対応するステレオ機器で使えます。通話モードでモノラルになった機器や仮想オーディオ出力では、音量・EQ処理を一時停止してmacOSの通常再生に戻します。ビルドにはSwift 6.2以降が必要です。
 
-## ビルドと起動
+## ダウンロード
+
+[GitHub Releases](https://github.com/kasuuuu4423/AppMixer/releases/latest) の `AppMixer-v*-macOS-arm64.zip` を展開し、`AppMixer.app` を開きます。配布版はApple Silicon搭載Mac向けで、Appleの公証は受けていません。開けない場合は、下記の手順でローカルビルドできます。
+
+## ソースからビルド
 
 ```sh
 bash Packaging/build-app.sh
@@ -25,3 +29,7 @@ open dist/AppMixer.app
 ```sh
 swift test
 ```
+
+## リリース
+
+`Packaging/Info.plist` のバージョンと一致する `vX.Y.Z` タグをGitHubにプッシュすると、GitHub Actionsがテスト、ビルド、ZIPの公開を行います。

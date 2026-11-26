@@ -1,0 +1,54 @@
+name: Release AppMixer
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="$(plutil -extract CFBundleShortVersionString raw Packaging/Info.plist)"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$RELEASE_TAG" != "v$version" ]]; then
+            echo "Release tag must match CFBundleShortVersionString (v$version)."
+            exit 1
+          fi
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build and archive Apple Silicon app
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          bash Packaging/build-app.sh
+          lipo dist/AppMixer.app/Contents/MacOS/AppMixer -verify_arch arm64
+          ditto -c -k --keepParent dist/AppMixer.app "dist/AppMixer-${RELEASE_TAG}-macOS-arm64.zip"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" "dist/AppMixer-${RELEASE_TAG}-macOS-arm64.zip" \
+            --verify-tag \
+            --title "AppMixer $RELEASE_TAG" \
+            --notes "対象：macOS 26以降のApple Silicon搭載Mac。配布版はAd Hoc署名のみで、Appleの公証は受けていません。" \
+            --generate-notes
